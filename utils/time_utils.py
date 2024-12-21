@@ -54,9 +54,8 @@ class Embedder:
     def embed(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
-
 class DeformNetwork(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, output_ch=59, multires=10, is_blender=False, is_6dof=False):
+    def __init__(self, D=8, W=256, input_ch=3, output_ch=59, multires=10, is_blender=False, is_6dof=False, condition_dim=512):
         super(DeformNetwork, self).__init__()
         self.D = D
         self.W = W
@@ -69,46 +68,61 @@ class DeformNetwork(nn.Module):
         self.embed_fn, xyz_input_ch = get_embedder(multires, 3)
         self.input_ch = xyz_input_ch + time_input_ch
 
+        self.is_blender = is_blender
+        self.is_6dof = is_6dof
+
         if is_blender:
             # Better for D-NeRF Dataset
             self.time_out = 30
-
             self.timenet = nn.Sequential(
                 nn.Linear(time_input_ch, 256), nn.ReLU(inplace=True),
-                nn.Linear(256, self.time_out))
+                nn.Linear(256, self.time_out)
+            )
 
             self.linear = nn.ModuleList(
                 [nn.Linear(xyz_input_ch + self.time_out, W)] + [
                     nn.Linear(W, W) if i not in self.skips else nn.Linear(W + xyz_input_ch + self.time_out, W)
-                    for i in range(D - 1)]
+                    for i in range(D - 1)
+                ]
             )
-
         else:
             self.linear = nn.ModuleList(
                 [nn.Linear(self.input_ch, W)] + [
                     nn.Linear(W, W) if i not in self.skips else nn.Linear(W + self.input_ch, W)
-                    for i in range(D - 1)]
+                    for i in range(D - 1)
+                ]
             )
-
-        self.is_blender = is_blender
-        self.is_6dof = is_6dof
 
         if is_6dof:
             self.branch_w = nn.Linear(W, 3)
             self.branch_v = nn.Linear(W, 3)
         else:
             self.gaussian_warp = nn.Linear(W, 3)
+
         self.gaussian_rotation = nn.Linear(W, 4)
         self.gaussian_scaling = nn.Linear(W, 3)
 
-    def forward(self, x, t):
+        self.num_layers = len(self.linear)
+        self.film_generator = FiLMGenerator(condition_dim, self.num_layers, W)
+
+    def forward(self, x, t, condition):
+        """
+        x: [N, 3]
+        t: [N, 1]
+        condition: [N, condition_dim], e.g. concatenation of CLIP + image features
+        """
+
+        gamma, beta = self.film_generator(condition)
+        
         t_emb = self.embed_time_fn(t)
         if self.is_blender:
-            t_emb = self.timenet(t_emb)  # better for D-NeRF Dataset
+            t_emb = self.timenet(t_emb)
         x_emb = self.embed_fn(x)
         h = torch.cat([x_emb, t_emb], dim=-1)
+        
         for i, l in enumerate(self.linear):
-            h = self.linear[i](h)
+            h = l(h)   
+            h = gamma[:, i, :] * h + beta[:, i, :]
             h = F.relu(h)
             if i in self.skips:
                 h = torch.cat([x_emb, t_emb, h], -1)
@@ -117,13 +131,37 @@ class DeformNetwork(nn.Module):
             w = self.branch_w(h)
             v = self.branch_v(h)
             theta = torch.norm(w, dim=-1, keepdim=True)
-            w = w / theta + 1e-5
-            v = v / theta + 1e-5
+            w = w / (theta + 1e-5)
+            v = v / (theta + 1e-5)
             screw_axis = torch.cat([w, v], dim=-1)
             d_xyz = exp_se3(screw_axis, theta)
         else:
             d_xyz = self.gaussian_warp(h)
+
         scaling = self.gaussian_scaling(h)
         rotation = self.gaussian_rotation(h)
 
         return d_xyz, rotation, scaling
+    
+    
+
+class FiLMGenerator(nn.Module):
+    def __init__(self, condition_dim, num_layers, layer_dim):
+        super(FiLMGenerator, self).__init__()
+        self.num_layers = num_layers
+        self.layer_dim = layer_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(condition_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_layers * layer_dim * 2)  # gamma and beta for each layer
+        )
+
+    def forward(self, condition):
+
+        out = self.mlp(condition)  # [batch_size, num_layers * layer_dim * 2]
+        out = out.view(-1, self.num_layers, self.layer_dim * 2)  
+        
+        gamma = out[..., :self.layer_dim]  # [batch_size, num_layers, layer_dim]
+        beta = out[..., self.layer_dim:]   # [batch_size, num_layers, layer_dim]
+        return gamma, beta
+    

@@ -19,6 +19,9 @@ from scene import Scene, GaussianModel, DeformModel
 from utils.general_utils import safe_state, get_linear_noise_func
 import uuid
 from tqdm import tqdm
+from PIL import Image
+import requests
+import torchvision.transforms as T
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -34,12 +37,12 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    deform = DeformModel(dataset.is_blender, dataset.is_6dof)
-    deform.train_setting(opt)
+    
 
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -52,6 +55,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     best_iteration = 0
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
+    
+    feature_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').to(device)
+    feature_model.eval()
+    dino_transform = T.Compose([
+    T.Resize((224, 224)),  
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406],   
+                std=[0.229, 0.224, 0.225]),
+    ])
+    image_path = "./dino.png"
+    image = Image.open(image_path).convert("RGB")
+    image_tensor = dino_transform(image).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        dino_features = feature_model(image_tensor)
+        
+    # model_name = "ViT-B/32"
+    # clip_model, clip_preprocess = clip.load(model_name, device=device)
+    # text_prompt = "An apple"
+    # text_tokens = clip.tokenize([text_prompt]).to(device)
+
+    # with torch.no_grad():
+    #     text_features = clip_model.encode_text(text_tokens)
+        
+    # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    print("DINO features:",dino_features.shape)
+    deform = DeformModel(dataset.is_blender, dataset.is_6dof,dino_features.shape[-1])
+    deform.train_setting(opt)
+    deform.load_weights('./pretrained3/')
+    deform.set_condition(dino_features)
+    
     for iteration in range(1, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -89,13 +123,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+            direction_consistency_loss = 0.0
         else:
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
 
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
-
+    
         # Render
         render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
@@ -259,7 +294,7 @@ if __name__ == "__main__":
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
                         default=[5000, 6000, 7_000] + list(range(10000, 40001, 1000)))
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000,5000,7_000, 10_000, 20_000, 30_000, 40000])
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

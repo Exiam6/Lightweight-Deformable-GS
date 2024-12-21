@@ -8,14 +8,18 @@ from utils.general_utils import get_expon_lr_func
 
 
 class DeformModel:
-    def __init__(self, is_blender=False, is_6dof=False):
-        self.deform = DeformNetwork(is_blender=is_blender, is_6dof=is_6dof).cuda()
+    def __init__(self, is_blender=False, is_6dof=False,condition_dim=512):
+        self.deform = DeformNetwork(is_blender=is_blender, is_6dof=is_6dof, condition_dim=condition_dim).cuda()
         self.optimizer = None
         self.spatial_lr_scale = 5
+        self.condition = None 
 
     def step(self, xyz, time_emb):
-        return self.deform(xyz, time_emb)
+        return self.deform(xyz, time_emb, self.condition)
 
+    def set_condition(self, condition):
+        self.condition = condition
+        
     def train_setting(self, training_args):
         l = [
             {'params': list(self.deform.parameters()),
